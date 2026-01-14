@@ -37,38 +37,66 @@ class MLBStatsAPI:
             print(f"API request failed: {url} - {e}")
             return {}
 
-    async def search_player(self, name: str) -> Optional[Dict]:
+    async def search_player(self, name: str, return_multiple: bool = False) -> Optional[Dict | List[Dict]]:
         """
         Search for a player by name.
         Returns player info dict or None if not found.
+        If return_multiple=True, returns list of all matches.
         """
+        # Try 2024 season first (most recent complete season)
         endpoint = "/sports/1/players"
         params = {
-            "season": datetime.now().year,
+            "season": 2024,
             "gameType": "R"  # Regular season
         }
 
         data = await self._request(endpoint, params)
         players = data.get("people", [])
 
-        # Search for matching name
+        # Search for matching name (case-insensitive substring match)
         name_lower = name.lower()
+        exact_matches = []
+        partial_matches = []
+
         for player in players:
             player_name = player.get("fullName", "").lower()
-            if name_lower in player_name:
-                return self._format_player_info(player)
+            # Exact match gets priority
+            if player_name == name_lower:
+                exact_matches.append(player)
+            # Collect substring matches
+            elif name_lower in player_name or player_name in name_lower:
+                partial_matches.append(player)
+
+        # Combine matches (exact first, then partial)
+        all_matches = exact_matches + partial_matches
+
+        if return_multiple:
+            # Return all matches formatted
+            return [self._format_player_info(p) for p in all_matches[:10]]  # Limit to 10
+
+        # Return first match if any found
+        if all_matches:
+            return self._format_player_info(all_matches[0])
 
         return None
 
     def _format_player_info(self, player_data: Dict) -> Dict:
         """Format player data into standard structure."""
         team_info = player_data.get("currentTeam", {})
+        team_name = team_info.get("name", "Unknown")
+
+        # Log if team info is missing for debugging
+        if team_name == "Unknown":
+            print(f"Warning: No team info found for player {player_data.get('fullName', 'Unknown Player')}")
+            print(f"Player data keys: {list(player_data.keys())}")
+            if team_info:
+                print(f"Team info keys: {list(team_info.keys())}")
 
         return {
             "id": player_data.get("id"),
             "name": player_data.get("fullName"),
             "primaryNumber": player_data.get("primaryNumber"),
-            "team": team_info.get("name", "Unknown"),
+            "team": team_name,
             "team_id": team_info.get("id"),
             "position": player_data.get("primaryPosition", {}).get("abbreviation", "N/A")
         }

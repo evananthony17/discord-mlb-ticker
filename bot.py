@@ -9,6 +9,7 @@ import json
 import os
 from datetime import datetime, timezone
 import asyncio
+from dotenv import load_dotenv
 from mlb_api import MLBStatsAPI
 from config import (
     POLL_INTERVAL_MINUTES,
@@ -17,6 +18,9 @@ from config import (
     ADMIN_ROLE_NAME,
     CHANNEL_ID
 )
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Bot setup
 intents = discord.Intents.default()
@@ -83,6 +87,71 @@ async def on_ready():
     await post_daily_schedule()
 
 
+class PlayerSelectView(discord.ui.View):
+    """View with buttons to select from multiple player matches."""
+    def __init__(self, players: list, original_interaction: discord.Interaction):
+        super().__init__(timeout=60)
+        self.players = players
+        self.original_interaction = original_interaction
+        self.selected_player = None
+
+        # Add a button for each player (max 5 for UI limits)
+        for i, player in enumerate(players[:5]):
+            button = discord.ui.Button(
+                label=f"{player['name']} - {player['team']}",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"player_{i}"
+            )
+            button.callback = self.create_callback(i)
+            self.add_item(button)
+
+        # Add cancel button
+        cancel_button = discord.ui.Button(
+            label="Cancel",
+            style=discord.ButtonStyle.secondary,
+            custom_id="cancel"
+        )
+        cancel_button.callback = self.cancel_callback
+        self.add_item(cancel_button)
+
+    def create_callback(self, index):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.original_interaction.user.id:
+                await interaction.response.send_message("This selection is not for you!", ephemeral=True)
+                return
+
+            self.selected_player = self.players[index]
+
+            # Add player to roster
+            roster = load_json(PLAYER_ROSTER_FILE, default=[])
+
+            if any(p['id'] == self.selected_player['id'] for p in roster):
+                await interaction.response.edit_message(
+                    content=f"❌ {self.selected_player['name']} is already being tracked!",
+                    view=None
+                )
+                return
+
+            roster.append(self.selected_player)
+            save_json(PLAYER_ROSTER_FILE, roster)
+
+            await interaction.response.edit_message(
+                content=f"✅ Now tracking **{self.selected_player['name']}** (#{self.selected_player.get('primaryNumber', 'N/A')}) - {self.selected_player['team']}",
+                view=None
+            )
+            self.stop()
+
+        return callback
+
+    async def cancel_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.original_interaction.user.id:
+            await interaction.response.send_message("This selection is not for you!", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(content="❌ Cancelled.", view=None)
+        self.stop()
+
+
 @bot.tree.command(name="add_player", description="Add a player to track")
 async def add_player(interaction: discord.Interaction, player_name: str):
     """Add a player to the tracking roster."""
@@ -95,28 +164,47 @@ async def add_player(interaction: discord.Interaction, player_name: str):
         )
         return
 
-    # Search for player
+    # Search for players (get all matches)
     await interaction.response.defer()
-    player_info = await mlb_api.search_player(player_name)
+    players = await mlb_api.search_player(player_name, return_multiple=True)
 
-    if not player_info:
-        await interaction.followup.send(f"Could not find player: {player_name}")
+    if not players:
+        await interaction.followup.send(f"Could not find any players matching: {player_name}")
         return
 
-    # Load roster and add player
-    roster = load_json(PLAYER_ROSTER_FILE, default=[])
+    # If only one match, add directly
+    if len(players) == 1:
+        player_info = players[0]
+        roster = load_json(PLAYER_ROSTER_FILE, default=[])
 
-    # Check if already tracked
-    if any(p['id'] == player_info['id'] for p in roster):
-        await interaction.followup.send(f"{player_info['name']} is already being tracked!")
+        if any(p['id'] == player_info['id'] for p in roster):
+            await interaction.followup.send(f"❌ {player_info['name']} is already being tracked!")
+            return
+
+        roster.append(player_info)
+        save_json(PLAYER_ROSTER_FILE, roster)
+
+        await interaction.followup.send(
+            f"✅ Now tracking **{player_info['name']}** (#{player_info.get('primaryNumber', 'N/A')}) - {player_info['team']}"
+        )
         return
 
-    roster.append(player_info)
-    save_json(PLAYER_ROSTER_FILE, roster)
-
-    await interaction.followup.send(
-        f"✅ Now tracking **{player_info['name']}** (#{player_info.get('primaryNumber', 'N/A')}) - {player_info['team']}"
+    # Multiple matches - show selection buttons
+    embed = discord.Embed(
+        title="Multiple Players Found",
+        description=f"Found {len(players)} players matching '{player_name}'. Select the one you want:",
+        color=discord.Color.blue()
     )
+
+    for i, player in enumerate(players[:5]):
+        embed.add_field(
+            name=f"{i+1}. {player['name']}",
+            value=f"{player['team']} - {player.get('position', 'N/A')} (#{player.get('primaryNumber', 'N/A')})",
+            inline=False
+        )
+
+    view = PlayerSelectView(players, interaction)
+    await interaction.followup.send(embed=embed, view=view)
 
 
 @bot.tree.command(name="remove_player", description="Remove a player from tracking")
